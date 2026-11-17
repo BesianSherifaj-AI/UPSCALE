@@ -1,0 +1,437 @@
+diff --git a/dlss_engine/frame_interpolation/models.py b/dlss_engine/frame_interpolation/models.py
+--- a/dlss_engine/frame_interpolation/models.py
++++ b/dlss_engine/frame_interpolation/models.py
+@@ -52,6 +52,8 @@
+     preview_compat: bool = True
+     # Optional original source for the final audio/metadata mux in chained jobs.
+     mux_source_path: str | None = None
++    # Overlap ordered stages without splitting their temporal histories.
++    parallel_processing: bool = True
+ 
+     @property
+     def target_rate(self) -> Fraction:
+diff --git a/dlss_engine/frame_interpolation/pipeline.py b/dlss_engine/frame_interpolation/pipeline.py
+new file mode 100644
+--- /dev/null
++++ b/dlss_engine/frame_interpolation/pipeline.py
+@@ -0,0 +1,244 @@
++"""Ordered, bounded streaming between independent DLSSG temporal histories.
++
++Each stage belongs to exactly one thread for the entire video. Frames are never
++split into independently initialized chunks. A stage can prepare its next motion
++field while a later stage is waiting for its native worker's GPU result.
++"""
++from __future__ import annotations
++
++from contextlib import suppress
++from dataclasses import asdict, dataclass, field
++from queue import Empty, Full, Queue
++import threading
++import time
++from typing import Callable, Iterable, Protocol, TypeVar
++
++from ..core.jobs import Cancelled
++
++
++T = TypeVar("T")
++_END = object()
++_POLL_SECONDS = 0.05
++
++
++class Stage(Protocol[T]):
++    def push(self, frame: T) -> Iterable[T]: ...
++
++
++@dataclass
++class PipelineStats:
++    mode: str
++    queue_capacity: int
++    stage_seconds: list[float] = field(default_factory=list)
++    stage_inputs: list[int] = field(default_factory=list)
++    stage_outputs: list[int] = field(default_factory=list)
++    maximum_queue_frames: list[int] = field(default_factory=list)
++    source_seconds: float = 0.0
++    sink_seconds: float = 0.0
++    elapsed_seconds: float = 0.0
++
++    def as_dict(self) -> dict:
++        return asdict(self)
++
++
++def queue_capacity(width: int, height: int, stage_count: int) -> int:
++    """Limit queued RGBA storage to ~96 MiB, or one frame per link minimum.
++
++Stage histories, current work and native allocations are additional. Limiting
++each link to four frames also prevents excessive decode-ahead on small videos.
++"""
++    if width <= 0 or height <= 0 or stage_count < 0:
++        raise ValueError("Pipeline dimensions must be positive and stage count nonnegative.")
++    frame_bytes = width * height * 4
++    return max(1, min(4, (96 * 1024 * 1024) // ((stage_count + 1) * frame_bytes)))
++
++
++class _Stopped(Exception):
++    pass
++
++
++def process_frames(
++    source: Iterable[T],
++    stages: list[Stage[T]],
++    consume: Callable[[T], None],
++    *,
++    cancel: threading.Event,
++    abort: Callable[[], None],
++    capacity: int,
++    parallel: bool,
++    join_timeout: float = 5.0,
++) -> PipelineStats:
++    """Consume every transformed frame in order, propagating the first failure.
++
++``abort`` must promptly terminate the native workers and encoder without waiting
++on their Python pipe locks. This releases blocked native reads/writes on error.
++Cancellation is polled even with full/empty queues. Shutdown joins have a shared
++deadline and threads are daemonized as a final guard against a broken extension.
++"""
++    if capacity < 1:
++        raise ValueError("Pipeline queue capacity must be at least one frame.")
++    count = len(stages)
++    stats = PipelineStats(
++        "parallel" if parallel and count else "serial", capacity if parallel and count else 0,
++        [0.0] * count, [0] * count, [0] * count,
++        [0] * (count + 1) if parallel and count else [],
++    )
++    started = time.perf_counter()
++
++    def check_cancel() -> None:
++        if cancel.is_set():
++            raise Cancelled("Frame interpolation stopped by user.")
++
++    def measured_source():
++        iterator = iter(source)
++        try:
++            while True:
++                check_cancel()
++                before = time.perf_counter()
++                try:
++                    item = next(iterator)
++                except StopIteration:
++                    return
++                finally:
++                    stats.source_seconds += time.perf_counter() - before
++                yield item
++        finally:
++            if hasattr(iterator, "close"):
++                iterator.close()
++
++    if stats.mode == "serial":
++        try:
++            for item in measured_source():
++                items = [item]
++                for index, stage in enumerate(stages):
++                    outputs = []
++                    for current in items:
++                        check_cancel()
++                        before = time.perf_counter()
++                        transformed = list(stage.push(current))
++                        stats.stage_seconds[index] += time.perf_counter() - before
++                        stats.stage_inputs[index] += 1
++                        stats.stage_outputs[index] += len(transformed)
++                        outputs.extend(transformed)
++                    items = outputs
++                for current in items:
++                    check_cancel()
++                    before = time.perf_counter()
++                    consume(current)
++                    stats.sink_seconds += time.perf_counter() - before
++            return stats
++        except BaseException:
++            with suppress(Exception):
++                abort()
++            raise
++        finally:
++            stats.elapsed_seconds = time.perf_counter() - started
++
++    queues = [Queue(maxsize=capacity) for _ in range(count + 1)]
++    stopped = threading.Event()
++    failure_lock = threading.Lock()
++    failures: list[BaseException] = []
++
++    def fail(exc: BaseException) -> None:
++        with failure_lock:
++            first = not failures
++            if first:
++                failures.append(exc)
++            stopped.set()
++        if first:
++            with suppress(Exception):
++                abort()
++
++    def check_running() -> None:
++        check_cancel()
++        if stopped.is_set():
++            raise _Stopped()
++
++    def put(index: int, value) -> None:
++        while True:
++            check_running()
++            try:
++                queues[index].put(value, timeout=_POLL_SECONDS)
++                stats.maximum_queue_frames[index] = max(
++                    stats.maximum_queue_frames[index], queues[index].qsize()
++                )
++                return
++            except Full:
++                pass
++
++    def get(index: int):
++        while True:
++            check_running()
++            try:
++                return queues[index].get(timeout=_POLL_SECONDS)
++            except Empty:
++                pass
++
++    def feed() -> None:
++        try:
++            for item in measured_source():
++                put(0, item)
++            put(0, _END)
++        except _Stopped:
++            pass
++        except BaseException as exc:
++            fail(exc)
++
++    def transform(index: int) -> None:
++        try:
++            while True:
++                current = get(index)
++                if current is _END:
++                    put(index + 1, _END)
++                    return
++                before = time.perf_counter()
++                outputs = stages[index].push(current)
++                # Materialize only this one input's bounded native result. Queue
++                # waiting is excluded from the measured stage processing time.
++                outputs = list(outputs)
++                stats.stage_seconds[index] += time.perf_counter() - before
++                stats.stage_inputs[index] += 1
++                stats.stage_outputs[index] += len(outputs)
++                for output in outputs:
++                    put(index + 1, output)
++                del current, outputs
++        except _Stopped:
++            pass
++        except BaseException as exc:
++            fail(exc)
++
++    prefix = f"dlss-pipeline-{id(stats):x}"
++    threads = [threading.Thread(target=feed, name=f"{prefix}-decode", daemon=True)]
++    threads.extend(
++        threading.Thread(target=transform, args=(index,), name=f"{prefix}-stage-{index}", daemon=True)
++        for index in range(count)
++    )
++    try:
++        for thread in reversed(threads):
++            thread.start()
++        while True:
++            current = get(count)
++            if current is _END:
++                break
++            before = time.perf_counter()
++            consume(current)
++            stats.sink_seconds += time.perf_counter() - before
++            del current
++    except _Stopped:
++        pass
++    except BaseException as exc:
++        fail(exc)
++    finally:
++        stopped.set()
++        deadline = time.monotonic() + join_timeout
++        for thread in threads:
++            if thread.ident is not None:
++                thread.join(timeout=max(0.0, deadline - time.monotonic()))
++        living = [thread.name for thread in threads if thread.is_alive()]
++        if living:
++            fail(RuntimeError("Interpolation pipeline shutdown timed out: " + ", ".join(living)))
++        stats.elapsed_seconds = time.perf_counter() - started
++    if failures:
++        raise failures[0]
++    check_cancel()
++    return stats
+diff --git a/dlss_engine/frame_interpolation/processor.py b/dlss_engine/frame_interpolation/processor.py
+--- a/dlss_engine/frame_interpolation/processor.py
++++ b/dlss_engine/frame_interpolation/processor.py
+@@ -25,6 +25,7 @@
+ from .guides import DLSSGGuideGenerator
+ from .models import FrameInterpolationOptions, FrameInterpolationResult
+ from .native import DirectDLSSGSession
++from .pipeline import process_frames, queue_capacity
+ from .scheduler import choose_interpolation_plan, output_frame_count
+ 
+ @dataclass(slots=True)
+@@ -351,51 +352,84 @@
+             writer = NearestTimestampWriter(nut, raw_stream, options.target_rate, output_count)
+ 
+             decoded = 0
+-            segment = 0
+             discontinuities = 0
+-            last_timestamp: Fraction | None = None
+-            first_timestamp: Fraction | None = None
+             nominal_interval = Fraction(1, 1) / source_rate
+-            container = av.open(str(source))
+-            try:
+-                stream = container.streams.video[0]
+-                stream.thread_type = "AUTO"
+-                for frame in container.decode(stream):
+-                    if decoded >= frames:
+-                        break
+-                    if controller.cancel.is_set():
+-                        raise Cancelled("Frame interpolation stopped by user.")
+-                    timestamp = (
+-                        Fraction(frame.pts) * Fraction(stream.time_base)
+-                        if frame.pts is not None and stream.time_base is not None
+-                        else Fraction(decoded, 1) / source_rate
++            parallel = bool(options.parallel_processing) and os.environ.get(
++                "DLSS_INTERPOLATION_PIPELINE", "1"
++            ).strip().lower() not in {"0", "false", "off", "no"}
++
++            def _source_frames():
++                nonlocal decoded, discontinuities
++                segment = 0
++                last_timestamp: Fraction | None = None
++                first_timestamp: Fraction | None = None
++                # The decoder and container are owned and closed by the feeder
++                # thread; PyAV containers are never shared across threads.
++                with av.open(str(source)) as container:
++                    stream = container.streams.video[0]
++                    stream.thread_type = "AUTO"
++                    for frame in container.decode(stream):
++                        if decoded >= frames:
++                            break
++                        if controller.cancel.is_set():
++                            raise Cancelled("Frame interpolation stopped by user.")
++                        timestamp = (
++                            Fraction(frame.pts) * Fraction(stream.time_base)
++                            if frame.pts is not None and stream.time_base is not None
++                            else Fraction(decoded, 1) / source_rate
++                        )
++                        if first_timestamp is None:
++                            first_timestamp = timestamp
++                        timestamp -= first_timestamp
++                        if last_timestamp is not None and (
++                            timestamp <= last_timestamp or timestamp - last_timestamp > nominal_interval * 2
++                        ):
++                            segment += 1
++                            discontinuities += 1
++                        last_timestamp = timestamp
++                        rgba = rotate_frame(frame.to_ndarray(format="rgba"), int(metadata["rotation"]))
++                        timed = TimedFrame(
++                            np.ascontiguousarray(rgba), timestamp, segment, "Source", decoded
++                        )
++                        decoded += 1
++                        yield timed
++
++            last_progress_bucket = -1
++
++            def _consume(item: TimedFrame) -> None:
++                nonlocal last_progress_bucket
++                writer.push(item)
++                bucket = writer.next_index // max(1, output_count // 100)
++                if bucket != last_progress_bucket:
++                    last_progress_bucket = bucket
++                    _report_progress(
++                        0.04 + 0.82 * writer.next_index / output_count,
++                        f"DLSSG output frame {writer.next_index}/{output_count}"
++                        + (" · parallel stages" if parallel and stages else ""),
+                     )
+-                    if first_timestamp is None:
+-                        first_timestamp = timestamp
+-                    timestamp -= first_timestamp
+-                    if last_timestamp is not None and (
+-                        timestamp <= last_timestamp or timestamp - last_timestamp > nominal_interval * 2
+-                    ):
+-                        segment += 1
+-                        discontinuities += 1
+-                    last_timestamp = timestamp
+-                    rgba = rotate_frame(frame.to_ndarray(format="rgba"), int(metadata["rotation"]))
+-                    timed = TimedFrame(
+-                        np.ascontiguousarray(rgba), timestamp, segment, "Source", decoded
+-                    )
+-                    items = [timed]
+-                    for stage in stages:
+-                        next_items: list[TimedFrame] = []
+-                        for item in items:
+-                            next_items.extend(stage.push(item))
+-                        items = next_items
+-                    for item in items:
+-                        writer.push(item)
+-                    decoded += 1
+-                    if decoded % max(1, frames // 100) == 0:
+-                        _report_progress(0.04 + 0.82 * decoded / frames, f"DLSSG source frame {decoded}/{frames}")
+-            finally:
+-                container.close()
++
++            def _abort_pipeline() -> None:
++                # Release blocking reads/writes before joining stage threads.
++                # Do not close Python buffered pipes while another thread uses
++                # them: close() may wait forever for that thread's pipe lock.
++                controller.terminate_processes()
++                for process in [*(session.process for session in sessions), encoder]:
++                    if process is not None and process.poll() is None:
++                        with suppress(OSError):
++                            process.kill()
++
++            pipeline_stats = process_frames(
++                _source_frames(), stages, _consume,
++                cancel=controller.cancel,
++                abort=_abort_pipeline,
++                capacity=queue_capacity(int(metadata["width"]), int(metadata["height"]), len(stages)),
++                parallel=parallel,
++            )
++            timings["frame_processing_seconds"] = pipeline_stats.elapsed_seconds
++            timings["decode_seconds"] = pipeline_stats.source_seconds
++            timings["writer_seconds"] = pipeline_stats.sink_seconds
++            for index, seconds in enumerate(pipeline_stats.stage_seconds, start=1):
++                timings[f"stage_{index}_seconds"] = seconds
+             writer.finish()
+             nut.close()
+             encoder.stdin.close()
+@@ -452,6 +486,8 @@
+                 "encoder": selected_encoder,
+                 "encoding_quality": quality,
+                 "elapsed_seconds": elapsed,
++                "pipeline": pipeline_stats.as_dict(),
++                "timings": timings,
+             }
+             report_path = logs_root / f"DLSSFG_{source.stem}_{stamp}.report.json"
+             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+diff --git a/dlss_engine/video/guides.py b/dlss_engine/video/guides.py
+--- a/dlss_engine/video/guides.py
++++ b/dlss_engine/video/guides.py
+@@ -4,6 +4,16 @@
+ 
+ import cv2
+ import numpy as np
++
++
++def _half_motion(motion: np.ndarray) -> np.ndarray:
++    # SIMD conversion preserves finite IEEE half values and avoids NumPy's
++    # slower scalar float16 conversion. Keep NumPy for exceptional fields so
++    # signaling-NaN payloads retain their original conversion behavior too.
++    if np.isfinite(motion).all():
++        return cv2.convertFp16(motion).view(np.float16)
++    return np.ascontiguousarray(motion.astype(np.float16))
++
+ 
+ @dataclass(slots=True)
+ class GuideFrame:
+@@ -55,7 +65,7 @@
+                 )
+                 motion[..., 0] *= self.width / self.flow_width
+                 motion[..., 1] *= self.height / self.flow_height
+-                motion = np.ascontiguousarray(motion.astype(np.float16))
++                motion = _half_motion(motion)
+         self.previous_gray = current
+         return GuideFrame(
+             motion=motion,

@@ -1,0 +1,24 @@
+--- a/dlss_engine/frame_interpolation/processor.py
++++ b/dlss_engine/frame_interpolation/processor.py
+@@ -235,6 +235,7 @@
+         sessions: list[DirectDLSSGSession] = []
+         encoder = None
+         encoder_thread = None
++        nut = None
+         try:
+             probe_started = time.perf_counter()
+             metadata = ffmpeg.probe_video(source, count_mode="metadata")
+@@ -536,6 +537,13 @@
+             )
+             raise RuntimeError(f"{exc}\nDiagnostic report: {failure_path.resolve()}") from exc
+         finally:
++            # PyAV owns buffered muxer state for encoder.stdin. Close it on the
++            # processing thread, before closing the underlying pipe, including
++            # cancellation and failure paths. Leaving it to cyclic GC can invoke
++            # native IO cleanup after the pipe and its callbacks are gone.
++            if nut is not None:
++                with suppress(Exception):
++                    nut.close()
+             for session in sessions:
+                 with suppress(Exception):
+                     session.close()

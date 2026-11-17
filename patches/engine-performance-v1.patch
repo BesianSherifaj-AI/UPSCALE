@@ -1,0 +1,144 @@
+diff --git a/dlss_engine/frame_interpolation/guides.py b/dlss_engine/frame_interpolation/guides.py
+index 09f6ac1e3ad282e5f20a65dec07431f56f388622..95840a6599e3d1fe3932b0351f9e8fddf3de072c 100644
+--- a/dlss_engine/frame_interpolation/guides.py
++++ b/dlss_engine/frame_interpolation/guides.py
+@@ -53,11 +53,21 @@ class DLSSGGuideGenerator:
+                 )
+                 calculated[..., 0] *= self.width / self.flow_width
+                 calculated[..., 1] *= self.height / self.flow_height
+-                finite = np.isfinite(calculated).all(axis=2)
+-                confidence = float(np.mean(finite))
+-                calculated[~finite] = 0
++                # Valid DIS fields are overwhelmingly the common case. Reducing
++                # the entire array avoids allocating and scanning a per-pixel
++                # two-channel mask for every frame (especially at 4K). Keep the
++                # original pixel-level handling when any vector is invalid.
++                if np.isfinite(calculated).all():
++                    confidence = 1.0
++                else:
++                    finite = np.isfinite(calculated).all(axis=2)
++                    confidence = float(np.mean(finite))
++                    calculated[~finite] = 0
+                 reset = confidence < 0.98
+-                vectors = self.zero if reset else np.ascontiguousarray(calculated.astype(np.float16))
++                # OpenCV uses the CPU's vectorized IEEE half conversion. Its
++                # int16 result contains half-float bits; view, never numerically
++                # cast, those bits as NumPy float16 for the worker protocol.
++                vectors = self.zero if reset else cv2.convertFp16(calculated).view(np.float16)
+             guide = Guide(vectors, reset, score, duplicate, confidence)
+         self.previous = current
+         return guide
+diff --git a/dlss_engine/frame_interpolation/models.py b/dlss_engine/frame_interpolation/models.py
+index ef4e2fd5ee40e2082a74461671a06b1c5eec3bc6..7f89ce7b81fe86a3a8c7b43a8f9d7d50b4516c5f 100644
+--- a/dlss_engine/frame_interpolation/models.py
++++ b/dlss_engine/frame_interpolation/models.py
+@@ -50,6 +50,8 @@ class FrameInterpolationOptions:
+     # True = truncated preview uses the forced H.264 SDR path (current behavior).
+     # False = truncated preview uses the user's codec/container (HDR preserved).
+     preview_compat: bool = True
++    # Optional original source for the final audio/metadata mux in chained jobs.
++    mux_source_path: str | None = None
+ 
+     @property
+     def target_rate(self) -> Fraction:
+diff --git a/dlss_engine/frame_interpolation/native.py b/dlss_engine/frame_interpolation/native.py
+index 1ad9f2bf7f156185fe32be70dcdf5cc31ab84f5d..b54d39ba225f0cea0eea06f0df6164b337fff136 100644
+--- a/dlss_engine/frame_interpolation/native.py
++++ b/dlss_engine/frame_interpolation/native.py
+@@ -29,6 +29,20 @@ def _read_exact(stream, size: int) -> bytes:
+     return bytes(data)
+ 
+ 
++def _read_exact_into(stream, target: np.ndarray) -> None:
++    """Fill an owned output frame without intermediate full-frame copies."""
++    view = memoryview(target).cast("B")
++    offset = 0
++    while offset < len(view):
++        count = stream.readinto(view[offset:])
++        if not count:
++            raise RuntimeError(
++                "The direct DLSSG worker closed its output unexpectedly "
++                f"after {offset} of {len(view)} frame bytes."
++            )
++        offset += count
++
++
+ class DirectDLSSGSession:
+     """One direct D3D12 NGX DLSSG history and binary stream."""
+ 
+@@ -148,12 +162,12 @@ class DirectDLSSGSession:
+             )
+         if disabled:
+             return []
+-        return [
+-            np.frombuffer(_read_exact(self.process.stdout, self.frame_bytes), np.uint8)
+-            .reshape(self.height, self.width, 4)
+-            .copy()
+-            for _ in range(generated)
+-        ]
++        frames = []
++        for _ in range(generated):
++            frame = np.empty((self.height, self.width, 4), dtype=np.uint8)
++            _read_exact_into(self.process.stdout, frame)
++            frames.append(frame)
++        return frames
+ 
+     def close(self) -> None:
+         if getattr(self, "closed", False):
+diff --git a/dlss_engine/frame_interpolation/processor.py b/dlss_engine/frame_interpolation/processor.py
+index 952564ca777a36b8d80f8fd8f6df2975c19b8bcf..5505a96573424a594f51550b8d7e731429d04fa6 100644
+--- a/dlss_engine/frame_interpolation/processor.py
++++ b/dlss_engine/frame_interpolation/processor.py
+@@ -354,6 +354,7 @@ def interpolate_video(
+             segment = 0
+             discontinuities = 0
+             last_timestamp: Fraction | None = None
++            first_timestamp: Fraction | None = None
+             nominal_interval = Fraction(1, 1) / source_rate
+             container = av.open(str(source))
+             try:
+@@ -369,6 +370,9 @@ def interpolate_video(
+                         if frame.pts is not None and stream.time_base is not None
+                         else Fraction(decoded, 1) / source_rate
+                     )
++                    if first_timestamp is None:
++                        first_timestamp = timestamp
++                    timestamp -= first_timestamp
+                     if last_timestamp is not None and (
+                         timestamp <= last_timestamp or timestamp - last_timestamp > nominal_interval * 2
+                     ):
+@@ -406,7 +410,7 @@ def interpolate_video(
+             _report_progress(0.9, "Muxing original audio, subtitles, chapters, and metadata")
+             ffmpeg.final_mux(
+                 temp_video,
+-                source,
++                Path(options.mux_source_path).resolve() if options.mux_source_path else source,
+                 output,
+                 options.container,
+                 controller,
+diff --git a/dlss_engine/video/models.py b/dlss_engine/video/models.py
+index 89ed6a20cedd4307d09bfe84826c06afbde8a2b3..4be79863617a2b38b073827fa7bea5a9a9f6ef49 100644
+--- a/dlss_engine/video/models.py
++++ b/dlss_engine/video/models.py
+@@ -31,6 +31,8 @@ class ConversionOptions:
+     # False = truncated preview uses the user's codec/container (HDR preserved).
+     preview_compat: bool = True
+     output_detail_strength: float = 1.0
++    # Optional original source for the final audio/metadata mux in chained jobs.
++    mux_source_path: str | None = None
+ 
+ @dataclass(slots=True)
+ class ConversionResult:
+diff --git a/dlss_engine/video/processor.py b/dlss_engine/video/processor.py
+index ed2acf24764d01e6eebfb42e0b77eff9ce232605..5c9e5ac1c310ab7c8530cdfd2863d4d30c20c08e 100644
+--- a/dlss_engine/video/processor.py
++++ b/dlss_engine/video/processor.py
+@@ -491,7 +491,7 @@ def convert_video(
+             mux_started = time.perf_counter()
+             ffmpeg.final_mux(
+                 temp_video,
+-                source,
++                Path(options.mux_source_path).resolve() if options.mux_source_path else source,
+                 output,
+                 options.container,
+                 controller,

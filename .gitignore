@@ -1,0 +1,21 @@
+# Runtime, installation, personal media, and local verification evidence
+.venv/
+engine/
+__pycache__/
+*.py[cod]
+*.tmp
+*.lnk
+settings.json
+queue.json*
+.upscale.lock
+logs/
+outputs/
+backups/
+CHECKPOINT.txt
+VERIFICATION.txt
+tests/*
+!tests/test_*.py
+!tests/gui_smoke.py
+!tests/cancel_smoke.py
+tools/*
+!tools/benchmark_video.py
