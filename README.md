@@ -1,6 +1,8 @@
 # Upscale
 
-A Windows desktop GUI for video upscaling and frame interpolation using the native NVIDIA engine from [ComfyUI NVIDIA DLSS Frame Interpolation](https://github.com/Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation). ComfyUI and PyTorch are not needed to run this GUI.
+A free Windows desktop GUI for video upscaling and frame interpolation using the native NVIDIA engine from [ComfyUI NVIDIA DLSS Frame Interpolation](https://github.com/Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation). ComfyUI and PyTorch are not needed to run this GUI.
+
+Download and use Upscale at no charge. No subscription or paid API is required; processing runs locally on a compatible NVIDIA RTX GPU. The app source is available under the [MIT license](LICENSE). Downloaded engine components and other dependencies keep their own licenses; see [third-party notices](THIRD-PARTY-NOTICES.md).
 
 ## Use
 
